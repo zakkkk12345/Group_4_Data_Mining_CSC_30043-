@@ -1,0 +1,199 @@
+
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, average_precision_score, confusion_matrix,
+    RocCurveDisplay, PrecisionRecallDisplay
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+# Load data
+train = pd.read_csv("Training Data.csv")
+test = pd.read_csv("Test data.csv")
+
+TARGET = "Loan Status"
+ID_COLS = [c for c in ["Loan ID", "Customer ID"] if c in train.columns]
+
+# Encode target
+y = (
+    train[TARGET]
+    .astype(str)
+    .str.lower()
+    .str.replace("_", " ")
+    .str.strip()
+    .str.contains("charged off")
+    .astype(int)
+)
+
+X = train.drop(columns=[TARGET] + ID_COLS, errors="ignore")
+X_test = test.drop(columns=ID_COLS, errors="ignore")
+
+
+# Missingness bar chart
+missing_pct = X.isna().mean().sort_values(ascending=False)
+plt.figure(figsize=(10, 4))
+missing_pct.plot(kind="bar")
+plt.ylabel("Proportion missing")
+plt.title("Missingness by feature")
+plt.tight_layout()
+plt.show()
+
+
+# Missingness heatmap (sampled)
+sample_X = X.sample(n=min(1000, len(X)), random_state=42)
+plt.figure(figsize=(10, 5))
+sns.heatmap(sample_X.isna(), cbar=False, yticklabels=False)
+plt.title("Missingness heatmap (sample)")
+plt.tight_layout()
+plt.show()
+
+
+# Correlation heatmap (numeric + target)
+num_cols_all = X.select_dtypes(include=[np.number]).columns
+corr_df = X[num_cols_all].copy()
+corr_df["TARGET"] = y
+corr = corr_df.corr(numeric_only=True)
+
+plt.figure(figsize=(10, 7))
+sns.heatmap(corr, cmap="viridis", linewidths=0.2)
+plt.title("Correlation heatmap (numeric features + target)")
+plt.tight_layout()
+plt.show()
+
+
+# Train/validation split
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+
+# Preprocessing
+cat_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+
+numeric_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_transformer = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("encoder", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocess = ColumnTransformer([
+    ("num", numeric_transformer, num_cols),
+    ("cat", categorical_transformer, cat_cols)
+])
+
+
+# Models
+base_models = {
+    "LogisticRegression": LogisticRegression(max_iter=500, class_weight="balanced"),
+    "RandomForest": RandomForestClassifier(
+        n_estimators=300, random_state=42, n_jobs=-1, class_weight="balanced"
+    ),
+    "GradientBoosting": GradientBoostingClassifier(random_state=42)
+}
+
+def make_pipeline(estimator):
+    return Pipeline([
+        ("preprocess", preprocess),
+        ("clf", CalibratedClassifierCV(estimator, cv=3, method="isotonic"))
+    ])
+
+
+# Train and evaluate models
+results = []
+pipes = {}
+val_probs = {}
+
+for name, model in base_models.items():
+    pipe = make_pipeline(model)
+    pipe.fit(X_train, y_train)
+    pipes[name] = pipe
+
+    proba = pipe.predict_proba(X_val)[:, 1]
+    val_probs[name] = proba
+    pred = (proba >= 0.5).astype(int)
+
+    results.append({
+        "Model": name,
+        "Accuracy": accuracy_score(y_val, pred),
+        "Precision": precision_score(y_val, pred, zero_division=0),
+        "Recall": recall_score(y_val, pred, zero_division=0),
+        "F1": f1_score(y_val, pred, zero_division=0),
+        "ROC_AUC": roc_auc_score(y_val, proba),
+        "PR_AUC": average_precision_score(y_val, proba)
+    })
+
+results_df = pd.DataFrame(results).sort_values("PR_AUC", ascending=False)
+print(results_df)
+
+best_name = results_df.iloc[0]["Model"]
+best_proba_val = val_probs[best_name]
+
+
+# ROC and PR curves
+RocCurveDisplay.from_predictions(y_val, best_proba_val)
+plt.title(f"ROC Curve – {best_name}")
+plt.show()
+
+PrecisionRecallDisplay.from_predictions(y_val, best_proba_val)
+plt.title(f"PR Curve – {best_name}")
+plt.show()
+
+
+# F2 threshold tuning
+def find_best_f2(y_true, proba):
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_t, best_f2 = 0.5, -1
+    for t in thresholds:
+        y_hat = (proba >= t).astype(int)
+        p = precision_score(y_true, y_hat, zero_division=0)
+        r = recall_score(y_true, y_hat, zero_division=0)
+        f2 = 0 if p + r == 0 else (5 * p * r) / (4 * p + r + 1e-12)
+        if f2 > best_f2:
+            best_f2, best_t = f2, t
+    return best_t, best_f2
+
+t_f2, best_f2 = find_best_f2(y_val, best_proba_val)
+pred_f2 = (best_proba_val >= t_f2).astype(int)
+
+
+# Fairness metric (equal opportunity)
+if "Annual Income" in X_val.columns:
+    group = pd.qcut(X_val["Annual Income"], q=4, duplicates="drop")
+    recall_by_group = (
+        pd.Series(y_val.values, index=group)
+        .groupby(level=0)
+        .apply(lambda yt: (pred_f2[yt.index] & yt).sum() / (yt.sum() + 1e-12))
+    )
+    eo_gap = recall_by_group.max() - recall_by_group.min()
+else:
+    eo_gap = np.nan
+
+
+# Final metrics output
+print("\nFinal metrics (F2-optimised)")
+print(f"Model: {best_name}")
+print(f"Accuracy:  {accuracy_score(y_val, pred_f2):.3f}")
+print(f"Precision: {precision_score(y_val, pred_f2, zero_division=0):.3f}")
+print(f"Recall:    {recall_score(y_val, pred_f2, zero_division=0):.3f}")
+print(f"F2-score:  {best_f2:.3f}")
+print(f"PR-AUC:    {average_precision_score(y_val, best_proba_val):.3f}")
+print(f"Equal Opportunity gap: {eo_gap:.3f}")
+
