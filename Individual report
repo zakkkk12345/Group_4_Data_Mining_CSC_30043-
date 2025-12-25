@@ -1,4 +1,3 @@
-
 import pandas as pd
 import numpy as np
 
@@ -10,7 +9,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, average_precision_score, confusion_matrix,
-    RocCurveDisplay, PrecisionRecallDisplay
+    RocCurveDisplay, PrecisionRecallDisplay, ConfusionMatrixDisplay
 )
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
@@ -48,15 +47,6 @@ plt.figure(figsize=(10, 4))
 missing_pct.plot(kind="bar")
 plt.ylabel("Proportion missing")
 plt.title("Missingness by feature")
-plt.tight_layout()
-plt.show()
-
-
-# Missingness heatmap (sampled)
-sample_X = X.sample(n=min(1000, len(X)), random_state=42)
-plt.figure(figsize=(10, 5))
-sns.heatmap(sample_X.isna(), cbar=False, yticklabels=False)
-plt.title("Missingness heatmap (sample)")
 plt.tight_layout()
 plt.show()
 
@@ -121,7 +111,9 @@ results = []
 pipes = {}
 val_probs = {}
 
+print("Training models...")
 for name, model in base_models.items():
+    print(f"  Training {name}...")
     pipe = make_pipeline(model)
     pipe.fit(X_train, y_train)
     pipes[name] = pipe
@@ -141,23 +133,27 @@ for name, model in base_models.items():
     })
 
 results_df = pd.DataFrame(results).sort_values("PR_AUC", ascending=False)
-print(results_df)
+print("\nModel Comparison:")
+print(results_df.to_string(index=False))
 
 best_name = results_df.iloc[0]["Model"]
 best_proba_val = val_probs[best_name]
 
 
 # ROC and PR curves
-RocCurveDisplay.from_predictions(y_val, best_proba_val)
-plt.title(f"ROC Curve – {best_name}")
+fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+RocCurveDisplay.from_predictions(y_val, best_proba_val, ax=axes[0])
+axes[0].set_title(f"ROC Curve – {best_name}")
+
+PrecisionRecallDisplay.from_predictions(y_val, best_proba_val, ax=axes[1])
+axes[1].set_title(f"PR Curve – {best_name}")
+
+plt.tight_layout()
 plt.show()
 
-PrecisionRecallDisplay.from_predictions(y_val, best_proba_val)
-plt.title(f"PR Curve – {best_name}")
-plt.show()
 
-
-# F2 threshold tuning
+# F2 threshold tuning (FIXED FORMULA)
 def find_best_f2(y_true, proba):
     thresholds = np.linspace(0.01, 0.99, 99)
     best_t, best_f2 = 0.5, -1
@@ -165,35 +161,111 @@ def find_best_f2(y_true, proba):
         y_hat = (proba >= t).astype(int)
         p = precision_score(y_true, y_hat, zero_division=0)
         r = recall_score(y_true, y_hat, zero_division=0)
-        f2 = 0 if p + r == 0 else (5 * p * r) / (4 * p + r + 1e-12)
+        # Fixed F2 formula: beta=2, so weight recall 2x more than precision
+        f2 = 0 if (p + r) == 0 else (5 * p * r) / (4 * p + r)
         if f2 > best_f2:
             best_f2, best_t = f2, t
     return best_t, best_f2
 
-t_f2, best_f2 = find_best_f2(y_val, best_proba_val)
-pred_f2 = (best_proba_val >= t_f2).astype(int)
+
+# Calculate F2-optimized threshold and predictions for ALL models
+model_thresholds = {}
+model_predictions = {}
+model_f2_scores = {}
+
+print("\nF2 Threshold Optimization:")
+for name in base_models.keys():
+    t_f2, f2_score = find_best_f2(y_val, val_probs[name])
+    pred_f2 = (val_probs[name] >= t_f2).astype(int)
+    
+    model_thresholds[name] = t_f2
+    model_predictions[name] = pred_f2
+    model_f2_scores[name] = f2_score
+    
+    print(f"  {name}: threshold={t_f2:.3f}, F2={f2_score:.3f}")
 
 
-# Fairness metric (equal opportunity)
-if "Annual Income" in X_val.columns:
-    group = pd.qcut(X_val["Annual Income"], q=4, duplicates="drop")
-    recall_by_group = (
-        pd.Series(y_val.values, index=group)
-        .groupby(level=0)
-        .apply(lambda yt: (pred_f2[yt.index] & yt).sum() / (yt.sum() + 1e-12))
+# Get best model info
+best_name = results_df.iloc[0]["Model"]
+best_proba_val = val_probs[best_name]
+best_threshold = model_thresholds[best_name]
+best_pred = model_predictions[best_name]
+
+
+# Confusion Matrix for best model
+cm = confusion_matrix(y_val, best_pred)
+ConfusionMatrixDisplay(cm, display_labels=["Fully Paid", "Charged Off"]).plot()
+plt.title(f"Confusion Matrix – {best_name} (F2-optimized)")
+plt.show()
+
+
+# Fairness metric (equal opportunity) for ALL models
+def calculate_fairness(y_true, y_pred, income_col):
+    """Calculate equal opportunity gap across income quartiles"""
+    group = pd.qcut(income_col, q=4, duplicates="drop")
+    
+    fairness_data = pd.DataFrame({
+        'y_true': y_true.values,
+        'y_pred': y_pred,
+        'group': group.values
+    }, index=y_true.index)
+    
+    # Calculate recall (TPR) for each group
+    recall_by_group = fairness_data.groupby('group').apply(
+        lambda x: (x['y_pred'] & x['y_true']).sum() / (x['y_true'].sum() + 1e-12)
     )
     eo_gap = recall_by_group.max() - recall_by_group.min()
-else:
-    eo_gap = np.nan
+    
+    return eo_gap, recall_by_group
+
+
+print("\nFAIRNESS ANALYSIS (Equal Opportunity)")
+
+fairness_results = []
+
+for name in base_models.keys():
+    eo_gap, recall_by_group = calculate_fairness(
+        y_val, 
+        model_predictions[name], 
+        X_val["Annual Income"]
+    )
+    
+    fairness_results.append({
+        "Model": name,
+        "Equal_Opportunity_Gap": eo_gap
+    })
+    
+    print(f"\n{name}:")
+    print(f"  Equal Opportunity Gap: {eo_gap:.3f}")
+    print("  Recall by Income Quartile:")
+    for quartile, recall in recall_by_group.items():
+        print(f"    {quartile}: {recall:.3f}")
+
+# Visualize fairness comparison
+fairness_df = pd.DataFrame(fairness_results)
+
+plt.figure(figsize=(10, 5))
+plt.bar(fairness_df["Model"], fairness_df["Equal_Opportunity_Gap"], 
+        color=['#1f77b4', '#ff7f0e', '#2ca02c'])
+plt.ylabel("Equal Opportunity Gap")
+plt.title("Fairness Comparison Across Models\n(Lower is better - indicates more equal treatment across income groups)")
+plt.xticks(rotation=45, ha='right')
+plt.axhline(y=0.1, color='r', linestyle='--', alpha=0.5, label='0.1 threshold')
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+best_eo_gap = fairness_df[fairness_df["Model"] == best_name]["Equal_Opportunity_Gap"].values[0]
 
 
 # Final metrics output
-print("\nFinal metrics (F2-optimised)")
+print("\nFINAL METRICS (F2-optimized)")
 print(f"Model: {best_name}")
-print(f"Accuracy:  {accuracy_score(y_val, pred_f2):.3f}")
-print(f"Precision: {precision_score(y_val, pred_f2, zero_division=0):.3f}")
-print(f"Recall:    {recall_score(y_val, pred_f2, zero_division=0):.3f}")
-print(f"F2-score:  {best_f2:.3f}")
+print(f"Optimal Threshold: {best_threshold:.3f}")
+print(f"Accuracy:  {accuracy_score(y_val, best_pred):.3f}")
+print(f"Precision: {precision_score(y_val, best_pred, zero_division=0):.3f}")
+print(f"Recall:    {recall_score(y_val, best_pred, zero_division=0):.3f}")
+print(f"F2-score:  {model_f2_scores[best_name]:.3f}")
 print(f"PR-AUC:    {average_precision_score(y_val, best_proba_val):.3f}")
-print(f"Equal Opportunity gap: {eo_gap:.3f}")
+print(f"Equal Opportunity gap: {best_eo_gap:.3f}")
 
