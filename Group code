@@ -1,0 +1,260 @@
+1️⃣ Full Python Code (Undergrad-appropriate, Research-Grounded)
+Save as e.g. loan_default_pipeline.py in the same folder as:
+Training Data.csv
+
+
+Test data.csv
+
+
+"""
+Loan Default Prediction – Research-Grounded ML Pipeline
+Models: Logistic Regression (baseline), Random Forest, Gradient Boosting
+
+Key design choices and research links (for report):
+- Median/mode imputation as robust baseline for loan data (Lu et al., 2025; Bryzgalova et al., 2025; Akinjole et al., 2024)
+- One-hot encoding for nominal features; target encoding considered for high-cardinality (Avanzi et al., 2024)
+- Standard scaling for linear model convergence (Lessmann et al., 2015)
+- class_weight="balanced" to handle imbalance (Wei, 2025; Li, 2025; Wang, 2022)
+- Logistic Regression as traditional baseline; Random Forest & Gradient Boosting as ensembles that often outperform in credit risk (Akinjole et al., 2024; Zhang, 2025; Nguyen & Ngo, 2025)
+- Calibration and cost-aware thresholding (Yang & Bi, 2025)
+- No preprocessing fit on Test → avoids leakage (Apicella et al., 2025)
+"""
+
+import pandas as pd
+import numpy as np
+
+from sklearn.model_selection import train_test_split
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, average_precision_score, confusion_matrix,
+    RocCurveDisplay, PrecisionRecallDisplay
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.calibration import CalibratedClassifierCV
+
+import matplotlib.pyplot as plt
+plt.rcParams["figure.dpi"] = 150
+
+
+# -----------------------------
+# 1. Load data
+# -----------------------------
+train = pd.read_csv("Training Data.csv")
+test = pd.read_csv("Test data.csv")
+
+TARGET = "Loan Status"
+ID_COLS = [c for c in ["Loan ID", "Customer ID"] if c in train.columns]
+
+# Map target: 1 = Charged Off, 0 = Fully Paid
+y = (
+    train[TARGET]
+    .astype(str)
+    .str.lower()
+    .str.replace("_", " ")
+    .str.strip()
+    .str.contains("charged off")
+    .astype(int)
+)
+
+X = train.drop(columns=[TARGET] + ID_COLS, errors="ignore")
+X_test = test.drop(columns=ID_COLS, errors="ignore")
+
+# -----------------------------
+# 2. Train / validation split (80/20 stratified)
+# -----------------------------
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.2, random_state=42, stratify=y
+)
+
+# -----------------------------
+# 3. Preprocessing: impute + encode + scale
+# -----------------------------
+cat_cols = X_train.select_dtypes(include=["object"]).columns.tolist()
+num_cols = X_train.select_dtypes(include=[np.number]).columns.tolist()
+
+numeric_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),      # median imputation
+    ("scaler", StandardScaler())                        # z-score scaling
+])
+
+categorical_transformer = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),        # mode imputation
+    ("encoder", OneHotEncoder(handle_unknown="ignore"))          # OHE for nominal
+])
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("num", numeric_transformer, num_cols),
+        ("cat", categorical_transformer, cat_cols)
+    ]
+)
+
+# -----------------------------
+# 4. Define models (class_weight for imbalance where available)
+# -----------------------------
+base_models = {
+    "LogisticRegression": LogisticRegression(
+        max_iter=500, class_weight="balanced"
+    ),
+    "RandomForest": RandomForestClassifier(
+        n_estimators=300,
+        random_state=42,
+        n_jobs=-1,
+        class_weight="balanced"
+    ),
+    "GradientBoosting": GradientBoostingClassifier(
+        random_state=42
+        # no class_weight here, imbalance is partly handled by the loss
+    )
+}
+
+def make_calibrated_pipeline(estimator):
+    """
+    Build a pipeline that:
+    - applies preprocessing
+    - wraps model in CalibratedClassifierCV (isotonic)
+    """
+    calibrated = CalibratedClassifierCV(estimator, cv=3, method="isotonic")
+    pipe = Pipeline(steps=[
+        ("preprocess", preprocess),
+        ("clf", calibrated)
+    ])
+    return pipe
+
+# -----------------------------
+# 5. Train, validate and compare models
+# -----------------------------
+results = []
+fitted_pipes = {}
+val_probas = {}
+
+for name, est in base_models.items():
+    print(f"\nTraining model: {name}")
+    pipe = make_calibrated_pipeline(est)
+    pipe.fit(X_train, y_train)
+    fitted_pipes[name] = pipe
+
+    # Probabilities and predictions on validation set
+    proba_val = pipe.predict_proba(X_val)[:, 1]
+    val_probas[name] = proba_val
+    pred_val = (proba_val >= 0.5).astype(int)
+
+    acc = accuracy_score(y_val, pred_val)
+    prec = precision_score(y_val, pred_val, zero_division=0)
+    rec = recall_score(y_val, pred_val, zero_division=0)
+    f1 = f1_score(y_val, pred_val, zero_division=0)
+    roc_auc = roc_auc_score(y_val, proba_val)
+    pr_auc = average_precision_score(y_val, proba_val)
+
+    results.append({
+        "Model": name,
+        "Accuracy": acc,
+        "Precision": prec,
+        "Recall": rec,
+        "F1": f1,
+        "ROC_AUC": roc_auc,
+        "PR_AUC": pr_auc
+    })
+
+results_df = pd.DataFrame(results).sort_values("PR_AUC", ascending=False)
+print("\nValidation metrics (80/20):\n", results_df.to_string(index=False))
+
+best_name = results_df.iloc[0]["Model"]
+print(f"\nSelected model (by PR_AUC): {best_name}")
+best_pipe = fitted_pipes[best_name]
+best_proba_val = val_probas[best_name]
+best_pred_val = (best_proba_val >= 0.5).astype(int)
+
+# -----------------------------
+# 6. Metrics and plots for best model at 0.5 threshold
+# -----------------------------
+cm = confusion_matrix(y_val, best_pred_val)
+print("\nConfusion matrix @ threshold 0.5:\n", cm)
+
+RocCurveDisplay.from_predictions(y_val, best_proba_val)
+plt.title(f"ROC Curve - {best_name}")
+plt.tight_layout()
+plt.savefig("roc_curve_best.png")
+plt.close()
+
+PrecisionRecallDisplay.from_predictions(y_val, best_proba_val)
+plt.title(f"PR Curve - {best_name}")
+plt.tight_layout()
+plt.savefig("pr_curve_best.png")
+plt.close()
+
+# -----------------------------
+# 7. Threshold tuning (F2 & cost-based)
+# -----------------------------
+def find_best_threshold_f2(y_true, proba):
+    thresholds = np.linspace(0.01, 0.99, 99)
+    best_t = 0.5
+    best_f2 = -1
+    for t in thresholds:
+        y_hat = (proba >= t).astype(int)
+        prec = precision_score(y_true, y_hat, zero_division=0)
+        rec = recall_score(y_true, y_hat, zero_division=0)
+        if prec + rec == 0:
+            f2 = 0
+        else:
+            beta2 = 4.0  # F2: recall weighted more heavily
+            f2 = (1 + beta2) * prec * rec / (beta2 * prec + rec + 1e-12)
+        if f2 > best_f2:
+            best_f2 = f2
+            best_t = t
+    return best_t, best_f2
+
+t_f2, best_f2 = find_best_threshold_f2(y_val, best_proba_val)
+print(f"\nF2-optimal threshold: {t_f2:.2f} (F2 = {best_f2:.3f})")
+
+def cost_at_threshold(y_true, proba, t, cost_fn=5.0, cost_fp=1.0):
+    y_hat = (proba >= t).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_true, y_hat).ravel()
+    return cost_fn * fn + cost_fp * fp
+
+thresholds = np.linspace(0.01, 0.99, 99)
+costs = [cost_at_threshold(y_val, best_proba_val, t) for t in thresholds]
+best_cost_idx = int(np.argmin(costs))
+t_cost = thresholds[best_cost_idx]
+print(f"Cost-minimising threshold: {t_cost:.2f} (FN:FP cost ratio = 5:1)")
+
+# -----------------------------
+# 8. Retrain on full training data and predict test set
+# -----------------------------
+final_pipe = make_calibrated_pipeline(base_models[best_name])
+final_pipe.fit(X, y)
+
+proba_test = final_pipe.predict_proba(X_test)[:, 1]
+label_test_f2 = (proba_test >= t_f2).astype(int)
+label_test_cost = (proba_test >= t_cost).astype(int)
+
+submission = pd.DataFrame({
+    "Loan ID": test.get("Loan ID", pd.Series(range(len(test)))),
+    "Predicted_Prob_ChargedOff": proba_test,
+    f"Predicted_Label_F2_t{t_f2:.2f}": label_test_f2,
+    f"Predicted_Label_Cost_t{t_cost:.2f}": label_test_cost
+})
+
+submission.to_csv("test_set_predictions.csv", index=False)
+print("\nSaved test predictions to 'test_set_predictions.csv'")
+print("Saved plots: roc_curve_best.png, pr_curve_best.png")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
